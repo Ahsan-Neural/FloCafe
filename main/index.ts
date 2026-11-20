@@ -960,53 +960,47 @@ function createWindow(): void {
     }, RENDERER_STABILITY_RESET_MS);
   });
 
-  mainWindow.webContents.on('render-process-gone', (event, details) => {
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
     log.error('[Window] Renderer process gone:', details.reason);
     console.error('[Window] Renderer process gone:', details.reason);
 
-    if (details.reason !== 'clean-exit') {
-      // Crash invalidated stability; cancel reset timer.
-      clearRendererStabilityResetTimer();
-      if (!isQuitting && !isShutdownRequested()) {
-        consecutiveRendererCrashes++;
-        cloudSync.captureOperationFailure({
-          capture_point: 'fc.electron.renderer.process_gone',
-          outcome: 'unknown',
-        });
-      }
-      if (consecutiveRendererCrashes >= GPU_FALLBACK_CRASH_THRESHOLD) {
-        shouldDisableGpuOnRelaunch = true;
-        log.error(
-          '[Window] Repeated renderer crashes — requesting relaunch with hardware acceleration disabled.',
-        );
-        requestRuntimeRelaunchOnce('renderer-repeated-crash-gpu-fallback');
-      }
+    if (
+      details.reason === 'clean-exit'
+      || mainWindow !== createdWindow
+      || isQuitting
+      || isShutdownRequested()
+    ) return;
+
+    clearRendererStabilityResetTimer();
+    consecutiveRendererCrashes++;
+    cloudSync.captureOperationFailure({
+      capture_point: 'fc.electron.renderer.process_gone',
+      outcome: 'unknown',
+    });
+    if (consecutiveRendererCrashes >= GPU_FALLBACK_CRASH_THRESHOLD) {
+      shouldDisableGpuOnRelaunch = true;
+      log.error(
+        '[Window] Repeated renderer crashes — requesting relaunch with hardware acceleration disabled.',
+      );
+      requestRuntimeRelaunchOnce('renderer-repeated-crash-gpu-fallback');
+      return;
     }
 
-    if (details.reason !== 'clean-exit' && mainWindow === createdWindow) {
-      dialog
-        .showMessageBox({
-          type: 'error',
-          title: 'App Crashed',
-          message: 'The app crashed and will restart.',
-          detail: `Reason: ${details.reason}`,
-          buttons: ['OK'],
-        })
-        .then(() => {
-          if (mainWindow !== createdWindow) return;
-          failedWindowRecovery.suppressAllClosedQuit(() => {
-            createdWindow.destroy();
-            if (mainWindow === createdWindow) mainWindow = null;
-            void handleMainWindowActivation();
-          });
-        })
-        .catch((error) => {
-          log.error('[Window] Renderer crash recovery failed:', error);
-          if (!isQuitting && !isShutdownRequested()) {
-            requestRuntimeRelaunchOnce('renderer-crash-recovery-failed');
-          }
+    void Promise.resolve()
+      .then(() => {
+        if (mainWindow !== createdWindow || isQuitting || isShutdownRequested()) return;
+        return failedWindowRecovery.suppressAllClosedQuit(() => {
+          if (!createdWindow.isDestroyed()) createdWindow.destroy();
+          if (mainWindow === createdWindow) mainWindow = null;
+          return handleMainWindowActivation();
         });
-    }
+      })
+      .catch((error) => {
+        log.error('[Window] Renderer crash recovery failed:', error);
+        if (!isQuitting && !isShutdownRequested()) {
+          requestRuntimeRelaunchOnce('renderer-crash-recovery-failed');
+        }
+      });
   });
 
   setupWindowLoadRetry(createdWindow, () => `http://localhost:${getServerPort()}`, {

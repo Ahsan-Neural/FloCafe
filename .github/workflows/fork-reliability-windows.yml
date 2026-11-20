@@ -1,0 +1,285 @@
+name: Fork reliability Windows installer
+
+on:
+  push:
+    branches: [codex/windows-installer-reliability]
+    paths:
+      - main/**
+      - shared/**
+      - tests/**
+      - frontend/**
+      - package.json
+      - package-lock.json
+      - .github/workflows/fork-reliability-windows.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-reliability-windows
+  cancel-in-progress: true
+
+env:
+  HUSKY: '0'
+  NEXT_TELEMETRY_DISABLED: '1'
+  BASELINE_SHA: d8dfa7bc649f90e730db2f52f16c0d1843531a08
+
+jobs:
+  core:
+    if: github.repository == 'Ahsan-Neural/FloCafe' && github.ref == 'refs/heads/codex/windows-installer-reliability'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22'
+      - run: mkdir -p evidence
+      - run: npm ci
+      - run: npm --prefix frontend ci
+      - run: npx --no-install electron-rebuild -f -w better-sqlite3
+      - name: Lint and desktop builds
+        run: |
+          set -o pipefail
+          npm run lint 2>&1 | tee evidence/lint.log
+          npm run build 2>&1 | tee evidence/backend-build.log
+          npm run build:frontend 2>&1 | tee evidence/frontend-build.log
+      - name: Complete standard suite including pretest
+        run: |
+          set -o pipefail
+          xvfb-run -a npm test 2>&1 | tee evidence/npm-test.log
+          if grep -F 'Skipped (ABI mismatch)' evidence/npm-test.log; then
+            echo 'Native ABI skips are not accepted as executed tests.'
+            exit 1
+          fi
+      - name: Database audit and translation checks
+        run: |
+          set -o pipefail
+          npm run audit:db 2>&1 | tee evidence/database-audit.log
+          npm run i18n:check 2>&1 | tee evidence/i18n.log
+          git diff --exit-code
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: reliability-core-evidence
+          path: evidence/
+          retention-days: 30
+
+  browser:
+    if: github.repository == 'Ahsan-Neural/FloCafe' && github.ref == 'refs/heads/codex/windows-installer-reliability'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      FLO_MATRIX_OFFLINE: '1'
+      FLO_WHATSAPP_SOCKET_DISABLED: '1'
+      FLO_E2E_SKIP_OPTIONAL_NETWORK: '1'
+      E2E_BASE_URL: http://127.0.0.1:33101
+      E2E_KDS_BASE_URL: http://127.0.0.1:33102
+      E2E_SERVER_APP_BASE_URL: http://127.0.0.1:33103
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22'
+      - run: npm ci
+      - run: npm --prefix frontend ci
+      - run: npx --no-install electron-rebuild -f -w better-sqlite3
+      - run: cd frontend && npx --no-install playwright install --with-deps chromium
+      - name: Standard browser system tests
+        run: npm run test:e2e:browser
+      - name: Additional permission and kitchen tiers
+        run: |
+          cd frontend
+          npx --no-install playwright test --config=playwright.config.ts --project=chromium --retries=0 --grep='@ci-tier1|@ci-tier2' --grep-invert='FINDING:|a paid order offers a refund, and issuing it settles against the recorded sale'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: reliability-browser-evidence
+          path: |
+            frontend/test-results/
+            frontend/playwright-report/
+          retention-days: 30
+
+  windows:
+    if: github.repository == 'Ahsan-Neural/FloCafe' && github.ref == 'refs/heads/codex/windows-installer-reliability'
+    needs: [core, browser, crash-regression, multiuser-soak]
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      FLO_MATRIX_OFFLINE: '1'
+      FLO_WHATSAPP_SOCKET_DISABLED: '1'
+      FLO_E2E_SKIP_OPTIONAL_NETWORK: '1'
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22'
+      - run: npm ci
+      - run: npm --prefix frontend ci
+      - name: Native Windows desktop system tests
+        run: npm run test:e2e:electron
+      - name: Build Windows x64 NSIS without publication
+        run: npx --no-install electron-builder --win nsis --x64 --publish never --config.npmRebuild=false --config.nsis.runAfterFinish=false --config.publish.owner=Ahsan-Neural --config.publish.repo=FloCafe
+      - name: Verify installer and record provenance
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Get-Item -LiteralPath 'release/flocafe-3.14.0-fork.1-win-x64.exe'
+          if ($installer.Length -lt 10000000) { throw 'Installer is unexpectedly small.' }
+          Get-FileHash -Algorithm SHA256 -LiteralPath $installer.FullName | Format-List | Out-File 'release/SHA256.txt'
+          [ordered]@{
+            kind = 'fork-reliability-candidate'
+            repository = 'Ahsan-Neural/FloCafe'
+            sourceCommit = $env:GITHUB_SHA
+            version = '3.14.0-fork.1'
+            platform = 'windows-x64'
+            signed = $false
+            publishedRelease = $false
+            runId = $env:GITHUB_RUN_ID
+            limitations = @('Physical printer hardware not tested', 'No production customer data used', 'Main-process fatal OOM is outside renderer recovery coverage', 'Thirty-minute backend soak is not a multi-day live store trial')
+          } | ConvertTo-Json -Depth 4 | Set-Content 'release/build-provenance.json'
+      - name: Install and uninstall on disposable Windows runner
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installDir = Join-Path $env:RUNNER_TEMP 'FloCafe-Reliability-Install'
+          $installer = (Resolve-Path 'release/flocafe-3.14.0-fork.1-win-x64.exe').Path
+          $process = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$installDir") -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Installer exited with $($process.ExitCode)" }
+          if (-not (Test-Path -LiteralPath (Join-Path $installDir 'Flo Cafe.exe'))) { throw 'Installed executable missing.' }
+          if (-not (Test-Path -LiteralPath (Join-Path $installDir 'resources/app.asar'))) { throw 'Installed application archive missing.' }
+          $uninstaller = Get-ChildItem -LiteralPath $installDir -Filter '*Uninstall*.exe' -File | Select-Object -First 1
+          if (-not $uninstaller) { throw 'Uninstaller missing.' }
+          $process = Start-Process -FilePath $uninstaller.FullName -ArgumentList '/S' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Uninstaller exited with $($process.ExitCode)" }
+          'Silent install/executable/archive/uninstaller checks passed on disposable runner.' | Set-Content 'release/installer-check.txt'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: success()
+        with:
+          name: flocafe-3.14.0-fork.1-reliability-windows-x64
+          path: |
+            release/flocafe-3.14.0-fork.1-win-x64.exe
+            release/SHA256.txt
+            release/build-provenance.json
+            release/installer-check.txt
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: reliability-windows-test-evidence
+          path: frontend/test-results/
+          retention-days: 30
+
+  crash-regression:
+    if: github.repository == 'Ahsan-Neural/FloCafe' && github.ref == 'refs/heads/codex/windows-installer-reliability'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      FLO_MATRIX_OFFLINE: '1'
+      FLO_E2E_SKIP_OPTIONAL_NETWORK: '1'
+      FLO_WHATSAPP_SOCKET_DISABLED: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22'
+      - run: npm ci
+      - run: npm --prefix frontend ci
+      - run: npx --no-install electron-rebuild -f -w better-sqlite3
+      - run: npm run build:frontend
+      - name: Prove regression detects the original blocking dialog
+        shell: bash
+        run: |
+          mkdir -p evidence
+          cp main/index.ts "$RUNNER_TEMP/fork-candidate-index.ts"
+          git show "$BASELINE_SHA:main/index.ts" > main/index.ts
+          npm run build
+          set +e
+          (cd frontend && xvfb-run -a npx --no-install playwright test e2e/desktop/automatic-crash-recovery.electron.spec.ts --config=playwright.electron.config.ts --project=electron-desktop --retries=0 --reporter=json) > evidence/original-crash-regression.json
+          baseline_status=$?
+          set -e
+          if [ "$baseline_status" -eq 0 ]; then
+            echo 'Regression unexpectedly passed against the original renderer handler.'
+            exit 1
+          fi
+          node <<'NODE'
+          const fs = require('node:fs');
+          const assert = require('node:assert/strict');
+          const report = JSON.parse(fs.readFileSync('evidence/original-crash-regression.json', 'utf8'));
+          assert.equal(report.stats.unexpected, 2);
+          assert.equal(report.stats.skipped, 0);
+          const failures = [];
+          function walk(suite) {
+            for (const spec of suite.specs || []) for (const test of spec.tests || []) {
+              for (const result of test.results || []) if (result.status !== 'passed') failures.push(result);
+            }
+            for (const child of suite.suites || []) walk(child);
+          }
+          for (const suite of report.suites) walk(suite);
+          assert.equal(failures.length, 2);
+          for (const failure of failures) assert.match(JSON.stringify(failure.errors), /recovery must not require a crash dialog/);
+          console.log('Both original-handler failures are the intended crash-dialog regression.');
+          NODE
+          cp "$RUNNER_TEMP/fork-candidate-index.ts" main/index.ts
+      - name: Verify automatic recovery with the candidate handler
+        shell: bash
+        run: |
+          npm run build
+          cd frontend
+          xvfb-run -a npx --no-install playwright test e2e/desktop/automatic-crash-recovery.electron.spec.ts --config=playwright.electron.config.ts --project=electron-desktop --retries=0 --reporter=json > ../evidence/candidate-crash-regression.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: reliability-crash-regression-evidence
+          path: |
+            evidence/
+            frontend/test-results/
+          retention-days: 30
+
+  multiuser-soak:
+    if: github.repository == 'Ahsan-Neural/FloCafe' && github.ref == 'refs/heads/codex/windows-installer-reliability'
+    needs: core
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      FLO_WORKLOAD_WAVE_DELAY_MS: '10000'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22'
+      - run: npm ci
+      - run: npm --prefix frontend ci
+      - run: npx --no-install electron-rebuild -f -w better-sqlite3
+      - name: Thirty-minute multi-user backend workload and reconciliation
+        shell: bash
+        run: |
+          mkdir -p evidence
+          set -o pipefail
+          xvfb-run -a npm run test:fork-workload 2>&1 | tee evidence/multiuser-soak.log
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: reliability-multiuser-soak-evidence
+          path: evidence/
+          retention-days: 30
