@@ -162,11 +162,63 @@ jobs:
           if ($process.ExitCode -ne 0) { throw "Installer exited with $($process.ExitCode)" }
           if (-not (Test-Path -LiteralPath (Join-Path $installDir 'Flo Cafe.exe'))) { throw 'Installed executable missing.' }
           if (-not (Test-Path -LiteralPath (Join-Path $installDir 'resources/app.asar'))) { throw 'Installed application archive missing.' }
+          $env:FLO_TEST_EXPECTED_VERSION = '3.14.0-fork.1'
+          $smokePath = Join-Path $env:RUNNER_TEMP 'flo-packaged-smoke.cjs'
+          $env:FLO_TEST_INSTALLED_EXE = Join-Path $installDir 'Flo Cafe.exe'
+          $env:FLO_TEST_PLAYWRIGHT = Join-Path (Get-Location).Path 'frontend/node_modules/playwright'
+          $env:FLO_TEST_EVIDENCE = Join-Path (Get-Location).Path 'release'
+          @'
+          const assert = require('node:assert/strict');
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const { _electron: electron } = require(process.env.FLO_TEST_PLAYWRIGHT);
+          (async () => {
+            const profile = fs.mkdtempSync(path.join(process.env.RUNNER_TEMP, 'flo-installed-smoke-'));
+            let application;
+            try {
+              application = await electron.launch({
+                executablePath: process.env.FLO_TEST_INSTALLED_EXE,
+                cwd: path.dirname(process.env.FLO_TEST_INSTALLED_EXE),
+                timeout: 60000,
+                env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, NODE_ENV: 'test',
+                  FLO_E2E_USER_DATA_DIR: profile, FLO_E2E_DB_PATH: path.join(profile, 'flo.db'),
+                  FLO_E2E_SKIP_OPTIONAL_NETWORK: '1', FLO_MATRIX_OFFLINE: '1',
+                  FLO_E2E_HIDDEN_WINDOW: '1', PORT: '34101', KDS_PORT: '34102', SERVER_APP_PORT: '34103' },
+              });
+              const deadline = Date.now() + 60000;
+              let page;
+              while (Date.now() < deadline) {
+                page = application.windows().find((window) => window.url().startsWith('http://localhost:34101'));
+                if (page) break;
+                await new Promise((resolve) => setTimeout(resolve, 200));
+              }
+              assert.ok(page, 'installed application must open its POS window');
+              await page.waitForFunction(() => Boolean(window.electronAPI));
+              const status = await page.evaluate(() => window.electronAPI.getStatus());
+              assert.equal(status.server, 'running');
+              assert.equal(status.kdsServer, 'running');
+              assert.equal(status.serverApp, 'running');
+              assert.equal(await application.evaluate(({ app }) => app.isPackaged), true);
+              assert.equal(await application.evaluate(({ app }) => app.getVersion()), process.env.FLO_TEST_EXPECTED_VERSION);
+              for (const port of [34101, 34102, 34103]) {
+                const response = await fetch('http://127.0.0.1:' + port + '/api/health');
+                assert.equal(response.ok, true);
+              }
+              await page.waitForFunction(() => document.body.innerText.trim().length > 20);
+              await page.screenshot({ path: path.join(process.env.FLO_TEST_EVIDENCE, 'installed-startup.png') });
+              fs.writeFileSync(path.join(process.env.FLO_TEST_EVIDENCE, 'packaged-startup.json'), JSON.stringify({ packaged: true, status, version: process.env.FLO_TEST_EXPECTED_VERSION, isolatedProfile: true }, null, 2));
+            } finally {
+              if (application) await application.close();
+            }
+          })().catch((error) => { console.error(error); process.exitCode = 1; });
+          '@ | Set-Content -LiteralPath $smokePath
+          node $smokePath
+          if ($LASTEXITCODE -ne 0) { throw 'Installed application startup smoke test failed.' }
           $uninstaller = Get-ChildItem -LiteralPath $installDir -Filter '*Uninstall*.exe' -File | Select-Object -First 1
           if (-not $uninstaller) { throw 'Uninstaller missing.' }
           $process = Start-Process -FilePath $uninstaller.FullName -ArgumentList '/S' -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Uninstaller exited with $($process.ExitCode)" }
-          'Silent install/executable/archive/uninstaller checks passed on disposable runner.' | Set-Content 'release/installer-check.txt'
+          'Silent install, installed runtime startup, service health, screenshot, and uninstaller checks passed on disposable runner.' | Set-Content 'release/installer-check.txt'
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: success()
         with:
@@ -176,6 +228,8 @@ jobs:
             release/SHA256.txt
             release/build-provenance.json
             release/installer-check.txt
+            release/packaged-startup.json
+            release/installed-startup.png
           if-no-files-found: error
           retention-days: 30
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
@@ -224,6 +278,8 @@ jobs:
           const fs = require('node:fs');
           const assert = require('node:assert/strict');
           const report = JSON.parse(fs.readFileSync('evidence/original-crash-regression.json', 'utf8'));
+          console.log('Original regression results:', JSON.stringify(report.stats));
+          console.log('Original regression suites:', JSON.stringify(report.suites));
           assert.equal(report.stats.unexpected, 2);
           assert.equal(report.stats.skipped, 0);
           const failures = [];

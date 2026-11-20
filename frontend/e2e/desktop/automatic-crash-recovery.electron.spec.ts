@@ -1,7 +1,6 @@
 import { expect, test } from '@playwright/test';
 import { createNativeElectronHarness, type NativeElectronHarness } from './native-harness';
 
-test.describe.configure({ mode: 'serial' });
 test.setTimeout(90_000);
 
 let harness: NativeElectronHarness;
