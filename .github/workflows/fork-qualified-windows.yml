@@ -1,0 +1,327 @@
+name: Fork qualified Windows installers
+
+on:
+  push:
+    branches: [codex/windows-installer-reliability]
+    paths: [.github/workflows/fork-qualified-windows.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-qualified-windows
+  cancel-in-progress: false
+
+env:
+  HUSKY: '0'
+  NEXT_TELEMETRY_DISABLED: '1'
+
+jobs:
+  qualification:
+    if: github.repository == 'Ahsan-Neural/FloCafe' && github.ref == 'refs/heads/codex/windows-installer-reliability'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Verify completed qualification jobs and exact source provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p evidence
+          node <<'NODE'
+          const assert = require('node:assert/strict');
+          const fs = require('node:fs');
+          const repo = 'Ahsan-Neural/FloCafe';
+          async function get(path) {
+            const response = await fetch('https://api.github.com/repos/' + repo + path, {
+              headers: { Authorization: 'Bearer ' + process.env.GH_TOKEN, Accept: 'application/vnd.github+json' },
+            });
+            assert.equal(response.ok, true, 'GitHub qualification HTTP ' + response.status);
+            return response.json();
+          }
+          (async () => {
+            const checks = [
+              { variant: 'baseline', run: 44762981749, workflowSha: '6afe40f623d540461a95fbdab8f06745f652a18e',
+                source: 'd8dfa7bc649f90e730db2f52f16c0d1843531a08', required: ['core', 'browser'] },
+              { variant: 'reliability', run: 44767068334, workflowSha: 'ff01175ee3b51d00ea0ed651d3c488d9b06ffd26',
+                source: 'ff01175ee3b51d00ea0ed651d3c488d9b06ffd26', required: ['core', 'browser', 'crash-regression', 'multiuser-soak'] },
+            ];
+            for (const check of checks) {
+              const run = await get('/actions/runs/' + check.run);
+              assert.equal(run.head_repository.full_name, repo);
+              assert.equal(run.head_sha, check.workflowSha);
+              const { jobs } = await get('/actions/runs/' + check.run + '/jobs?per_page=100');
+              for (const name of check.required) {
+                const job = jobs.find((candidate) => candidate.name === name);
+                assert.ok(job, 'Missing qualification job ' + name);
+                assert.equal(job.conclusion, 'success', 'Qualification failed: ' + check.variant + '/' + name);
+              }
+              const windows = jobs.find((candidate) => candidate.name === 'windows');
+              for (const name of ['Native Windows desktop system tests', 'Build Windows x64 NSIS without publication']) {
+                assert.equal(windows?.steps?.find((step) => step.name === name)?.conclusion, 'success', 'Prior Windows check: ' + name);
+              }
+              console.log('QUALIFIED ' + JSON.stringify(check));
+            }
+            fs.writeFileSync('evidence/qualification.json', JSON.stringify({
+              repository: repo, checks,
+              priorPackagingFailure: 'Screenshot capture timed out after functional startup checks; installation verification is repeated in this workflow.',
+              hydrationEvidenceRun: 44764832348,
+              originalCharacterizationEvidenceRun: 44767701678,
+            }, null, 2));
+          })().catch((error) => { console.error(error); process.exitCode = 1; });
+          NODE
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: completed-source-qualification
+          path: evidence/
+          retention-days: 30
+
+  supplemental:
+    if: github.repository == 'Ahsan-Neural/FloCafe' && github.ref == 'refs/heads/codex/windows-installer-reliability'
+    needs: qualification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: baseline
+            source: d8dfa7bc649f90e730db2f52f16c0d1843531a08
+          - variant: reliability
+            source: ff01175ee3b51d00ea0ed651d3c488d9b06ffd26
+    env:
+      FLO_MATRIX_OFFLINE: '1'
+      FLO_E2E_SKIP_OPTIONAL_NETWORK: '1'
+      FLO_WHATSAPP_SOCKET_DISABLED: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ matrix.source }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22'
+      - run: npm ci
+      - run: npm --prefix frontend ci
+      - run: npx --no-install electron-rebuild -f -w better-sqlite3
+      - name: Replace obsolete defect demonstrations with explicit desired-behavior checks in the runner
+        run: |
+          mkdir -p evidence
+          node <<'NODE'
+          const fs = require('node:fs');
+          const assert = require('node:assert/strict');
+          const historyPath = 'frontend/e2e/ops-admin/order-history.spec.ts';
+          let history = fs.readFileSync(historyPath, 'utf8');
+          history = history.replace('FINDING: search only sees the orders already loaded, and older sales are unreachable', 'FORKCHECK: order search finds sales beyond the first page');
+          let start = history.indexOf('    // The screen, however, cannot find it.');
+          let end = history.indexOf('\n  });', start);
+          assert.ok(start >= 0 && end > start, 'Expected history characterization block');
+          history = history.slice(0, start) + "    await page.goto(`${E2E_BASE_URL}/orders`);\n    await page.getByRole('button', { name: 'All', exact: true }).first().click();\n    await page.getByPlaceholder('Search by order number, name, or phone…').fill(target.order_number);\n    await expect(page.getByRole('button').filter({ hasText: `#${target.order_number}` }).first()).toBeVisible();\n    await expect(page.getByText(/No orders found/i)).toHaveCount(0);" + history.slice(end);
+          fs.writeFileSync(historyPath, history);
+          const staffPath = 'frontend/e2e/ops-admin/staff-roles.spec.ts';
+          let staff = fs.readFileSync(staffPath, 'utf8');
+          staff = staff.replace('FINDING: the staff route renders for a server instead of turning them away', 'FORKCHECK: server cannot open staff management');
+          start = staff.indexOf('    // But the client-side gate is missing:');
+          end = staff.indexOf('\n  });', start);
+          assert.ok(start >= 0 && end > start, 'Expected staff characterization block');
+          staff = staff.slice(0, start) + "    await login(page, 'owner');\n    await page.evaluate((t) => localStorage.setItem('token', t), token);\n    await page.goto(`${E2E_BASE_URL}/staff`);\n    await expect(page).not.toHaveURL(/\\/staff\\/?$/);\n    await expect(page.getByRole('heading', { name: /Staff/i })).toHaveCount(0);" + staff.slice(end);
+          fs.writeFileSync(staffPath, staff);
+          NODE
+          git diff -- frontend/e2e/ops-admin/order-history.spec.ts frontend/e2e/ops-admin/staff-roles.spec.ts > evidence/positive-checks.patch
+      - run: npm run build && npm run build:frontend
+      - run: cd frontend && npx --no-install playwright install --with-deps chromium
+      - name: Verify older-order search, staff access denial, and actual refund flow
+        run: |
+          cd frontend
+          npx --no-install playwright test --config=playwright.config.ts --project=chromium --retries=0 --grep='FORKCHECK:|a paid order offers a refund, and issuing it settles against the recorded sale' --reporter=json > ../evidence/supplemental-browser.json
+      - name: Validate all three checks executed successfully
+        if: always()
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const assert = require('node:assert/strict');
+          const report = JSON.parse(fs.readFileSync('evidence/supplemental-browser.json', 'utf8'));
+          console.log('SUPPLEMENTAL_POSITIVE ' + JSON.stringify(report.stats));
+          assert.equal(report.stats.expected, 3);
+          assert.equal(report.stats.unexpected, 0);
+          assert.equal(report.stats.skipped, 0);
+          NODE
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: supplemental-positive-${{ matrix.variant }}
+          path: |
+            evidence/
+            frontend/test-results/
+          retention-days: 30
+
+  windows:
+    if: github.repository == 'Ahsan-Neural/FloCafe' && github.ref == 'refs/heads/codex/windows-installer-reliability'
+    needs: [qualification, supplemental]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: baseline
+            source: d8dfa7bc649f90e730db2f52f16c0d1843531a08
+            version: '3.14.0'
+            updater_owner: FreeOpenSourcePOS
+          - variant: reliability
+            source: ff01175ee3b51d00ea0ed651d3c488d9b06ffd26
+            version: '3.14.0-fork.2'
+            updater_owner: Ahsan-Neural
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      FLO_MATRIX_OFFLINE: '1'
+      FLO_WHATSAPP_SOCKET_DISABLED: '1'
+      FLO_E2E_SKIP_OPTIONAL_NETWORK: '1'
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      SOURCE_COMMIT: ${{ matrix.source }}
+      BUILD_VARIANT: ${{ matrix.variant }}
+      BUILD_VERSION: ${{ matrix.version }}
+      UPDATER_OWNER: ${{ matrix.updater_owner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ matrix.source }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22'
+      - run: npm ci
+      - run: npm --prefix frontend ci
+      - name: Native Windows desktop system tests
+        run: npm run test:e2e:electron
+      - name: Build Windows x64 NSIS without publication
+        run: npx --no-install electron-builder --win nsis --x64 --publish never --config.npmRebuild=false --config.nsis.runAfterFinish=false --config.publish.owner="$UPDATER_OWNER" --config.publish.repo=FloCafe
+      - name: Verify installer and record provenance
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Get-Item -LiteralPath 'release/flocafe-${{ matrix.version }}-win-x64.exe'
+          if ($installer.Length -lt 10000000) { throw 'Installer is unexpectedly small.' }
+          Get-FileHash -Algorithm SHA256 -LiteralPath $installer.FullName | Format-List | Out-File 'release/SHA256.txt'
+          [ordered]@{
+            kind = $env:BUILD_VARIANT
+            repository = 'Ahsan-Neural/FloCafe'
+            sourceCommit = $env:SOURCE_COMMIT
+            version = $env:BUILD_VERSION
+            platform = 'windows-x64'
+            signed = $false
+            publishedRelease = $false
+            runId = $env:GITHUB_RUN_ID
+            limitations = @('Physical printer hardware not tested', 'No production customer data used', 'Fatal main-process OOM is outside renderer recovery coverage')
+          } | ConvertTo-Json -Depth 4 | Set-Content 'release/build-provenance.json'
+      - name: Install and uninstall on disposable Windows runner
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installDir = Join-Path $env:RUNNER_TEMP 'FloCafe-Baseline-Install'
+          $installer = (Resolve-Path 'release/flocafe-${{ matrix.version }}-win-x64.exe').Path
+          $process = Start-Process -WindowStyle Hidden -FilePath $installer -ArgumentList @('/S', "/D=$installDir") -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Installer exited with $($process.ExitCode)" }
+          if (-not (Test-Path -LiteralPath (Join-Path $installDir 'Flo Cafe.exe'))) { throw 'Installed executable missing.' }
+          if (-not (Test-Path -LiteralPath (Join-Path $installDir 'resources/app.asar'))) { throw 'Installed application archive missing.' }
+          $env:FLO_TEST_EXPECTED_VERSION = $env:BUILD_VERSION
+          $smokePath = Join-Path $env:RUNNER_TEMP 'flo-packaged-smoke.cjs'
+          $env:FLO_TEST_INSTALLED_EXE = Join-Path $installDir 'Flo Cafe.exe'
+          $env:FLO_TEST_PLAYWRIGHT = Join-Path (Get-Location).Path 'frontend/node_modules/playwright'
+          $env:FLO_TEST_EVIDENCE = Join-Path (Get-Location).Path 'release'
+          @'
+          const assert = require('node:assert/strict');
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const { _electron: electron } = require(process.env.FLO_TEST_PLAYWRIGHT);
+          (async () => {
+            const profile = fs.mkdtempSync(path.join(process.env.RUNNER_TEMP, 'flo-installed-smoke-'));
+            let application;
+            try {
+              application = await electron.launch({
+                executablePath: process.env.FLO_TEST_INSTALLED_EXE,
+                cwd: path.dirname(process.env.FLO_TEST_INSTALLED_EXE),
+                timeout: 60000,
+                env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined, NODE_ENV: 'test',
+                  FLO_E2E_USER_DATA_DIR: profile, FLO_E2E_DB_PATH: path.join(profile, 'flo.db'),
+                  FLO_E2E_SKIP_OPTIONAL_NETWORK: '1', FLO_MATRIX_OFFLINE: '1',
+                  FLO_E2E_HIDDEN_WINDOW: '0', PORT: '34101', KDS_PORT: '34102', SERVER_APP_PORT: '34103' },
+              });
+              const deadline = Date.now() + 60000;
+              let page;
+              while (Date.now() < deadline) {
+                page = application.windows().find((window) => window.url().startsWith('http://localhost:34101'));
+                if (page) break;
+                await new Promise((resolve) => setTimeout(resolve, 200));
+              }
+              assert.ok(page, 'installed application must open its POS window');
+              await page.waitForFunction(() => Boolean(window.electronAPI));
+              const status = await page.evaluate(() => window.electronAPI.getStatus());
+              assert.equal(status.server, 'running');
+              assert.equal(status.kdsServer, 'running');
+              assert.equal(status.serverApp, 'running');
+              assert.equal(await application.evaluate(({ app }) => app.isPackaged), true);
+              assert.equal(await application.evaluate(({ app }) => app.getVersion()), process.env.FLO_TEST_EXPECTED_VERSION);
+              for (const port of [34101, 34102, 34103]) {
+                const response = await fetch('http://127.0.0.1:' + port + '/api/health');
+                assert.equal(response.ok, true);
+              }
+              await page.waitForFunction(() => document.body.innerText.trim().length > 20);
+              await application.evaluate(({ BrowserWindow }) => {
+                const window = BrowserWindow.getAllWindows().find((candidate) => candidate.webContents.getURL().startsWith('http://localhost:34101'));
+                if (window) { window.show(); window.focus(); }
+              });
+              let screenshot = 'captured';
+              try {
+                await page.screenshot({ path: path.join(process.env.FLO_TEST_EVIDENCE, 'installed-startup.png'), timeout: 10000 });
+              } catch (error) {
+                screenshot = 'unavailable on cloud desktop';
+                fs.writeFileSync(path.join(process.env.FLO_TEST_EVIDENCE, 'screenshot-note.txt'), String(error));
+                console.warn('Optional screenshot unavailable; functional startup assertions completed:', error.message);
+              }
+              fs.writeFileSync(path.join(process.env.FLO_TEST_EVIDENCE, 'packaged-startup.json'), JSON.stringify({ packaged: true, status, screenshot, version: process.env.FLO_TEST_EXPECTED_VERSION, isolatedProfile: true }, null, 2));
+            } finally {
+              if (application) await application.close();
+            }
+          })().catch((error) => { console.error(error); process.exitCode = 1; });
+          '@ | Set-Content -LiteralPath $smokePath
+          node $smokePath
+          if ($LASTEXITCODE -ne 0) { throw 'Installed application startup smoke test failed.' }
+          $uninstaller = Get-ChildItem -LiteralPath $installDir -Filter '*Uninstall*.exe' -File | Select-Object -First 1
+          if (-not $uninstaller) { throw 'Uninstaller missing.' }
+          $process = Start-Process -WindowStyle Hidden -FilePath $uninstaller.FullName -ArgumentList '/S' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Uninstaller exited with $($process.ExitCode)" }
+          $deadline = (Get-Date).AddSeconds(30)
+          while ((Test-Path -LiteralPath (Join-Path $installDir 'Flo Cafe.exe')) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 250 }
+          if (Test-Path -LiteralPath (Join-Path $installDir 'Flo Cafe.exe')) { throw 'Installed executable remains after uninstall.' }
+          Copy-Item -LiteralPath 'LICENSE' -Destination 'release/LICENSE-FloCafe.txt'
+          'Silent install, installed runtime startup, service health, and uninstall checks passed on disposable runner.' | Set-Content 'release/installer-check.txt'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: success()
+        with:
+          name: flocafe-${{ matrix.version }}-${{ matrix.variant }}-windows-x64
+          path: |
+            release/flocafe-${{ matrix.version }}-win-x64.exe
+            release/SHA256.txt
+            release/build-provenance.json
+            release/installer-check.txt
+            release/packaged-startup.json
+            release/installed-startup.png
+            release/screenshot-note.txt
+            release/LICENSE-FloCafe.txt
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: ${{ matrix.variant }}-windows-test-evidence
+          path: |
+            frontend/test-results/
+            release/packaged-startup.json
+            release/screenshot-note.txt
+          retention-days: 30
