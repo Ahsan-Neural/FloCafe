@@ -1,0 +1,45 @@
+name: Fork test evidence review
+
+on:
+  push:
+    branches: [codex/windows-installer-reliability]
+    paths: [.github/workflows/fork-test-evidence-review.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  inspect:
+    if: github.repository == 'Ahsan-Neural/FloCafe' && github.ref == 'refs/heads/codex/windows-installer-reliability'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Read the preserved baseline payment failure snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const { spawnSync } = require('node:child_process');
+          (async () => {
+            const response = await fetch('https://api.github.com/repos/Ahsan-Neural/FloCafe/actions/artifacts/14642066845/zip', {
+              headers: { Authorization: 'Bearer ' + process.env.GH_TOKEN, Accept: 'application/vnd.github+json' },
+            });
+            if (!response.ok) throw new Error('Artifact download HTTP ' + response.status);
+            const archive = path.join(process.env.RUNNER_TEMP, 'baseline-browser-evidence.zip');
+            fs.writeFileSync(archive, Buffer.from(await response.arrayBuffer()));
+            const listing = spawnSync('unzip', ['-Z1', archive], { encoding: 'utf8' });
+            if (listing.status !== 0) throw new Error(listing.stderr);
+            const entries = listing.stdout.split('\n').filter((entry) => entry.endsWith('error-context.md'));
+            console.log('Failure snapshots:', entries.length);
+            for (const entry of entries) {
+              const result = spawnSync('unzip', ['-p', archive, entry], { encoding: 'utf8' });
+              if (result.status !== 0) throw new Error(result.stderr);
+              console.log('FAILURE_SNAPSHOT ' + entry);
+              console.log(result.stdout);
+            }
+          })().catch((error) => { console.error(error); process.exitCode = 1; });
+          NODE
