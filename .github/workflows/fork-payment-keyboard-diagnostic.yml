@@ -1,4 +1,4 @@
-name: Fork focused payment keyboard diagnostic
+name: Fork focused keyboard and hydration diagnostics
 
 on:
   push:
@@ -79,5 +79,72 @@ jobs:
         if: always()
         with:
           name: isolated-baseline-keyboard-evidence
+          path: frontend/test-results/
+          retention-days: 30
+
+  native-hydration:
+    if: github.repository == 'Ahsan-Neural/FloCafe' && github.ref == 'refs/heads/codex/windows-installer-reliability'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      HUSKY: '0'
+      NEXT_TELEMETRY_DISABLED: '1'
+      FLO_MATRIX_OFFLINE: '1'
+      FLO_E2E_SKIP_OPTIONAL_NETWORK: '1'
+      FLO_WHATSAPP_SOCKET_DISABLED: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22'
+      - run: npm ci
+      - run: npm --prefix frontend ci
+      - run: npx --no-install electron-rebuild -f -w better-sqlite3
+      - name: Create focused hydration regression
+        shell: bash
+        run: |
+          cat > frontend/e2e/desktop/fork-hydration.electron.spec.ts <<'TEST'
+          import { expect, test } from '@playwright/test';
+          import { createNativeElectronHarness, type NativeElectronHarness } from './native-harness';
+
+          test.setTimeout(120_000);
+          let harness: NativeElectronHarness;
+          test.afterAll(async () => { await harness?.close(); });
+
+          test('core desktop routes hydrate without renderer exceptions or hydration errors', async () => {
+            harness = await createNativeElectronHarness();
+            const errors: string[] = [];
+            harness.page.on('pageerror', (error) => errors.push(error.message));
+            harness.page.on('console', (message) => {
+              if (message.type() === 'error' && /hydration|hydrating|server rendered html|react error #(418|423|425)/i.test(message.text())) {
+                errors.push(message.text());
+              }
+            });
+            await harness.authenticateDashboard();
+            const routes = ['/dashboard', '/pos', '/orders', '/customers', '/products', '/inventory', '/settings'];
+            for (const route of routes) {
+              await harness.page.goto('http://localhost:' + harness.ports.main + route, { waitUntil: 'domcontentloaded' });
+              await expect(harness.page.getByTestId('desktop-drag-surface')).toBeVisible();
+              await expect(harness.page.locator('[data-slot="sidebar-container"]')).toBeVisible();
+              await expect.poll(async () => harness.page.evaluate(() => window.electronAPI?.getStatus())).toMatchObject({
+                server: 'running', kdsServer: 'running', serverApp: 'running',
+              });
+              expect(await harness.page.locator('body').innerText()).not.toMatch(/application error: a client-side exception/i);
+              expect(errors, 'renderer errors after route ' + route).toEqual([]);
+            }
+            console.log('HYDRATION_REPORT ' + JSON.stringify({ routes, rendererErrors: errors, nativeElectron: true }));
+          });
+          TEST
+      - run: npm run build && npm run build:frontend
+      - name: Check native renderer hydration on seven core routes
+        run: |
+          cd frontend
+          xvfb-run -a npx --no-install playwright test e2e/desktop/fork-hydration.electron.spec.ts --config=playwright.electron.config.ts --project=electron-desktop --retries=0 --reporter=line --trace=on
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: native-hydration-evidence
           path: frontend/test-results/
           retention-days: 30
