@@ -1,0 +1,79 @@
+name: Fork supplemental browser coverage
+
+on:
+  push:
+    branches: [codex/windows-installer-reliability]
+    paths: [.github/workflows/fork-supplemental-browser.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  excluded-by-default:
+    if: github.repository == 'Ahsan-Neural/FloCafe' && github.ref == 'refs/heads/codex/windows-installer-reliability'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: baseline
+            source: d8dfa7bc649f90e730db2f52f16c0d1843531a08
+          - variant: reliability
+            source: ff01175ee3b51d00ea0ed651d3c488d9b06ffd26
+    env:
+      HUSKY: '0'
+      NEXT_TELEMETRY_DISABLED: '1'
+      FLO_MATRIX_OFFLINE: '1'
+      FLO_E2E_SKIP_OPTIONAL_NETWORK: '1'
+      FLO_WHATSAPP_SOCKET_DISABLED: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ matrix.source }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22'
+      - run: npm ci
+      - run: npm --prefix frontend ci
+      - run: npx --no-install electron-rebuild -f -w better-sqlite3
+      - run: npm run build && npm run build:frontend
+      - run: cd frontend && npx --no-install playwright install --with-deps chromium
+      - name: Execute finding-labelled and previously excluded refund cases
+        shell: bash
+        run: |
+          mkdir -p evidence
+          cd frontend
+          npx --no-install playwright test --config=playwright.config.ts --project=chromium --retries=0 --grep='FINDING:|a paid order offers a refund, and issuing it settles against the recorded sale' --reporter=json > ../evidence/supplemental-browser.json
+      - name: Summarize every supplemental result
+        if: always()
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const file = 'evidence/supplemental-browser.json';
+          if (!fs.existsSync(file)) { console.log('Supplemental test report not produced.'); process.exit(1); }
+          const report = JSON.parse(fs.readFileSync(file, 'utf8'));
+          console.log('SUPPLEMENTAL_STATS ' + JSON.stringify(report.stats));
+          function walk(suite) {
+            for (const spec of suite.specs || []) {
+              console.log('SUPPLEMENTAL_CASE ' + JSON.stringify({ title: spec.title, ok: spec.ok,
+                results: (spec.tests || []).flatMap((test) => (test.results || []).map((result) => ({
+                  status: result.status, errors: (result.errors || []).map((error) => error.message),
+                }))),
+              }));
+            }
+            for (const child of suite.suites || []) walk(child);
+          }
+          for (const suite of report.suites) walk(suite);
+          NODE
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: supplemental-browser-${{ matrix.variant }}
+          path: |
+            evidence/
+            frontend/test-results/
+          retention-days: 30
