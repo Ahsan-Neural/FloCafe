@@ -16,9 +16,6 @@ concurrency:
 env:
   HUSKY: '0'
   NEXT_TELEMETRY_DISABLED: '1'
-  FLO_MATRIX_OFFLINE: '1'
-  FLO_WHATSAPP_SOCKET_DISABLED: '1'
-  FLO_E2E_SKIP_OPTIONAL_NETWORK: '1'
   BASELINE_SHA: d8dfa7bc649f90e730db2f52f16c0d1843531a08
 
 jobs:
@@ -70,6 +67,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
+      FLO_MATRIX_OFFLINE: '1'
+      FLO_WHATSAPP_SOCKET_DISABLED: '1'
+      FLO_E2E_SKIP_OPTIONAL_NETWORK: '1'
       E2E_BASE_URL: http://127.0.0.1:33101
       E2E_KDS_BASE_URL: http://127.0.0.1:33102
       E2E_SERVER_APP_BASE_URL: http://127.0.0.1:33103
@@ -106,6 +106,9 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 90
     env:
+      FLO_MATRIX_OFFLINE: '1'
+      FLO_WHATSAPP_SOCKET_DISABLED: '1'
+      FLO_E2E_SKIP_OPTIONAL_NETWORK: '1'
       CSC_IDENTITY_AUTO_DISCOVERY: 'false'
     defaults:
       run:
