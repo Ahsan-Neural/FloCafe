@@ -17,7 +17,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: fork-reliability-windows
+  group: fork-reliability-windows-${{ github.sha }}
   cancel-in-progress: true
 
 env:
@@ -312,7 +312,6 @@ jobs:
 
   multiuser-soak:
     if: github.repository == 'Ahsan-Neural/FloCafe' && github.ref == 'refs/heads/codex/windows-installer-reliability'
-    needs: core
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -332,7 +331,23 @@ jobs:
         run: |
           mkdir -p evidence
           set -o pipefail
-          xvfb-run -a npm run test:fork-workload 2>&1 | tee evidence/multiuser-soak.log
+          xvfb-run -a node <<'NODE' 2>&1 | tee evidence/multiuser-soak.log
+          const { spawnSync } = require('node:child_process');
+          const path = require('node:path');
+          const { pathToFileURL } = require('node:url');
+          const result = spawnSync(require('electron'), [
+            '--expose-gc', '--import', pathToFileURL(require.resolve('tsx')).href,
+            '-r', path.resolve('tests/register-tsx.cjs'),
+            path.resolve('tests/fork-multiuser-workload.test.ts'),
+          ], {
+            stdio: 'inherit',
+            env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', TSX_TSCONFIG_PATH: path.resolve('tests/tsconfig.json') },
+            timeout: 35 * 60 * 1000,
+          });
+          if (result.error) console.error(result.error);
+          if (result.signal) console.error('Soak terminated by signal:', result.signal);
+          process.exit(result.status ?? 1);
+          NODE
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:
