@@ -957,6 +957,7 @@ function createWindow(): void {
     rendererStabilityResetTimer = setTimeout(() => {
       rendererStabilityResetTimer = null;
       consecutiveRendererCrashes = 0;
+      relaunchAttemptGuard.markRuntimeRecovered();
     }, RENDERER_STABILITY_RESET_MS);
   });
 
@@ -1661,7 +1662,6 @@ async function initialize(): Promise<void> {
       });
 
       runtimeState = 'ready';
-      relaunchAttemptGuard.markRuntimeRecovered();
       log.info('[Lifecycle] Runtime is ready');
       console.log('[Flo] Creating window...');
       void showStatus('welcome');

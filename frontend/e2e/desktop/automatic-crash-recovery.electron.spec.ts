@@ -5,8 +5,8 @@ test.setTimeout(90_000);
 
 let harness: NativeElectronHarness;
 
-test.beforeEach(async () => {
-  harness = await createNativeElectronHarness();
+test.beforeEach(async ({}, testInfo) => {
+  harness = await createNativeElectronHarness({ runtimeRelaunchAttempt: testInfo.title.includes('relaunch loop') });
   await harness.authenticateDashboard();
 });
 
@@ -78,3 +78,45 @@ for (const failure of ['renderer-crash', 'simulated-oom'] as const) {
     expect(persisted.body.setting.value).toBe('Crash recovery preserved this store');
   });
 }
+
+test('a recently relaunched app stops a renderer relaunch loop before stability is established', async () => {
+  let relaunches = 0;
+  let exhausted = 0;
+  harness.app.on('console', (message) => {
+    if (message.text() === 'FORK_RELAUNCH_REQUESTED') relaunches++;
+    if (message.text() === 'FORK_RELAUNCH_EXHAUSTED') exhausted++;
+  });
+  await harness.app.evaluate(({ app, dialog }) => {
+    app.relaunch = () => { console.log('FORK_RELAUNCH_REQUESTED'); };
+    const original = dialog.showMessageBox.bind(dialog);
+    dialog.showMessageBox = ((...args: unknown[]) => {
+      const options = args[args.length - 1] as { title?: string } | undefined;
+      if (options?.title === 'Flo needs to restart') {
+        console.log('FORK_RELAUNCH_EXHAUSTED');
+        return Promise.resolve({ response: 1, checkboxChecked: false });
+      }
+      return Reflect.apply(original, dialog, args);
+    }) as typeof dialog.showMessageBox;
+  });
+
+  const recovered = harness.app.waitForEvent('window', { timeout: 30_000 });
+  await harness.app.evaluate(({ BrowserWindow }) => {
+    const window = BrowserWindow.getAllWindows().find((candidate) => candidate.webContents.getURL().startsWith('http://localhost:'));
+    if (!window) throw new Error('POS window not found');
+    window.webContents.emit('render-process-gone', {}, { reason: 'oom', exitCode: -1 });
+  });
+  const page = await recovered;
+  await page.waitForURL((url) => url.port === String(harness.ports.main), { timeout: 30_000 });
+  harness.setActivePage(page);
+  await expect(page.getByTestId('desktop-drag-surface')).toBeVisible();
+
+  const closed = harness.app.waitForEvent('close', { timeout: 30_000 });
+  await harness.app.evaluate(({ BrowserWindow }) => {
+    const window = BrowserWindow.getAllWindows().find((candidate) => candidate.webContents.getURL().startsWith('http://localhost:'));
+    if (!window) throw new Error('Recovered POS window not found');
+    window.webContents.emit('render-process-gone', {}, { reason: 'oom', exitCode: -1 });
+  });
+  await closed;
+  expect(exhausted, 'restart budget must remain exhausted until the renderer is stable').toBe(1);
+  expect(relaunches).toBe(0);
+});

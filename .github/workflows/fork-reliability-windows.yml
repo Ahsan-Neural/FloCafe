@@ -138,14 +138,14 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $installer = Get-Item -LiteralPath 'release/flocafe-3.14.0-fork.1-win-x64.exe'
+          $installer = Get-Item -LiteralPath 'release/flocafe-3.14.0-fork.2-win-x64.exe'
           if ($installer.Length -lt 10000000) { throw 'Installer is unexpectedly small.' }
           Get-FileHash -Algorithm SHA256 -LiteralPath $installer.FullName | Format-List | Out-File 'release/SHA256.txt'
           [ordered]@{
             kind = 'fork-reliability-candidate'
             repository = 'Ahsan-Neural/FloCafe'
             sourceCommit = $env:GITHUB_SHA
-            version = '3.14.0-fork.1'
+            version = '3.14.0-fork.2'
             platform = 'windows-x64'
             signed = $false
             publishedRelease = $false
@@ -157,12 +157,12 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $installDir = Join-Path $env:RUNNER_TEMP 'FloCafe-Reliability-Install'
-          $installer = (Resolve-Path 'release/flocafe-3.14.0-fork.1-win-x64.exe').Path
+          $installer = (Resolve-Path 'release/flocafe-3.14.0-fork.2-win-x64.exe').Path
           $process = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$installDir") -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Installer exited with $($process.ExitCode)" }
           if (-not (Test-Path -LiteralPath (Join-Path $installDir 'Flo Cafe.exe'))) { throw 'Installed executable missing.' }
           if (-not (Test-Path -LiteralPath (Join-Path $installDir 'resources/app.asar'))) { throw 'Installed application archive missing.' }
-          $env:FLO_TEST_EXPECTED_VERSION = '3.14.0-fork.1'
+          $env:FLO_TEST_EXPECTED_VERSION = '3.14.0-fork.2'
           $smokePath = Join-Path $env:RUNNER_TEMP 'flo-packaged-smoke.cjs'
           $env:FLO_TEST_INSTALLED_EXE = Join-Path $installDir 'Flo Cafe.exe'
           $env:FLO_TEST_PLAYWRIGHT = Join-Path (Get-Location).Path 'frontend/node_modules/playwright'
@@ -222,9 +222,9 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: success()
         with:
-          name: flocafe-3.14.0-fork.1-reliability-windows-x64
+          name: flocafe-3.14.0-fork.2-reliability-windows-x64
           path: |
-            release/flocafe-3.14.0-fork.1-win-x64.exe
+            release/flocafe-3.14.0-fork.2-win-x64.exe
             release/SHA256.txt
             release/build-provenance.json
             release/installer-check.txt
@@ -267,7 +267,7 @@ jobs:
           git show "$BASELINE_SHA:main/index.ts" > main/index.ts
           npm run build
           set +e
-          (cd frontend && xvfb-run -a npx --no-install playwright test e2e/desktop/automatic-crash-recovery.electron.spec.ts --config=playwright.electron.config.ts --project=electron-desktop --retries=0 --reporter=json) > evidence/original-crash-regression.json
+          (cd frontend && xvfb-run -a npx --no-install playwright test e2e/desktop/automatic-crash-recovery.electron.spec.ts --config=playwright.electron.config.ts --project=electron-desktop --retries=0 --grep='recovers automatically' --reporter=json) > evidence/original-crash-regression.json
           baseline_status=$?
           set -e
           if [ "$baseline_status" -eq 0 ]; then
@@ -293,6 +293,38 @@ jobs:
           assert.equal(failures.length, 2);
           for (const failure of failures) assert.match(JSON.stringify(failure.errors), /recovery must not require a crash dialog/);
           console.log('Both original-handler failures are the intended crash-dialog regression.');
+          NODE
+          cp "$RUNNER_TEMP/fork-candidate-index.ts" main/index.ts
+      - name: Prove regression detects premature restart-budget reset
+        shell: bash
+        run: |
+          git show 6afe40f623d540461a95fbdab8f06745f652a18e:main/index.ts > main/index.ts
+          npm run build
+          set +e
+          (cd frontend && xvfb-run -a npx --no-install playwright test e2e/desktop/automatic-crash-recovery.electron.spec.ts --config=playwright.electron.config.ts --project=electron-desktop --retries=0 --grep='relaunch loop' --reporter=json) > evidence/previous-restart-budget.json
+          previous_status=$?
+          set -e
+          if [ "$previous_status" -eq 0 ]; then
+            echo 'Restart-loop regression unexpectedly passed against the previous handler.'
+            exit 1
+          fi
+          node <<'NODE'
+          const fs = require('node:fs');
+          const assert = require('node:assert/strict');
+          const report = JSON.parse(fs.readFileSync('evidence/previous-restart-budget.json', 'utf8'));
+          assert.equal(report.stats.unexpected, 1);
+          assert.equal(report.stats.skipped, 0);
+          const failures = [];
+          function walk(suite) {
+            for (const spec of suite.specs || []) for (const test of spec.tests || []) {
+              for (const result of test.results || []) if (result.status !== 'passed') failures.push(result);
+            }
+            for (const child of suite.suites || []) walk(child);
+          }
+          for (const suite of report.suites) walk(suite);
+          assert.equal(failures.length, 1);
+          assert.match(JSON.stringify(failures[0].errors), /restart budget must remain exhausted until the renderer is stable/);
+          console.log('The previous handler fails the intended restart-budget regression.');
           NODE
           cp "$RUNNER_TEMP/fork-candidate-index.ts" main/index.ts
       - name: Verify automatic recovery with the candidate handler

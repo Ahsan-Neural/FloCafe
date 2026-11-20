@@ -328,7 +328,7 @@ async function boundedRelaunchClose(
   }
 }
 
-export async function createNativeElectronHarness(): Promise<NativeElectronHarness> {
+export async function createNativeElectronHarness(options: { runtimeRelaunchAttempt?: boolean } = {}): Promise<NativeElectronHarness> {
   // Headless by default so a local run never pops windows over the developer's
   // desktop. FLO_E2E_SHOW_WINDOW=1 restores the visible-window variant for
   // native focus/window-state coverage.
@@ -364,7 +364,7 @@ export async function createNativeElectronHarness(): Promise<NativeElectronHarne
     app = await electron.launch({
       executablePath: electronPath,
       cwd: repoRoot,
-      args: ['.', `--remote-debugging-port=${ports.devTools}`],
+      args: ['.', `--remote-debugging-port=${ports.devTools}`, ...(options.runtimeRelaunchAttempt ? ['--flo-runtime-relaunch-attempt'] : [])],
       env,
     });
     const initialPid = app.process().pid;
@@ -494,7 +494,7 @@ export async function createNativeElectronHarness(): Promise<NativeElectronHarne
         const newApp = await electron.launch({
           executablePath: electronPath,
           cwd: repoRoot,
-          args: ['.', `--remote-debugging-port=${ports.devTools}`],
+          args: ['.', `--remote-debugging-port=${ports.devTools}`, ...(options.runtimeRelaunchAttempt ? ['--flo-runtime-relaunch-attempt'] : [])],
           env,
         });
         newApp.on('console', (message) => console.log(`[Native Electron] ${message.text()}`));
