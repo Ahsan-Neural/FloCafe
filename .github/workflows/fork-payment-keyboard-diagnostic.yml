@@ -1,0 +1,83 @@
+name: Fork focused payment keyboard diagnostic
+
+on:
+  push:
+    branches: [codex/windows-installer-reliability]
+    paths: [.github/workflows/fork-payment-keyboard-diagnostic.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  isolated-baseline:
+    if: github.repository == 'Ahsan-Neural/FloCafe' && github.ref == 'refs/heads/codex/windows-installer-reliability'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      HUSKY: '0'
+      NEXT_TELEMETRY_DISABLED: '1'
+      FLO_MATRIX_OFFLINE: '1'
+      FLO_E2E_SKIP_OPTIONAL_NETWORK: '1'
+      FLO_WHATSAPP_SOCKET_DISABLED: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: d8dfa7bc649f90e730db2f52f16c0d1843531a08
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22'
+      - run: npm ci
+      - run: npm --prefix frontend ci
+      - run: npx --no-install electron-rebuild -f -w better-sqlite3
+      - name: Read installed Next client-component guidance
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const root = 'frontend/node_modules/next/dist/docs';
+          if (!fs.existsSync(root)) throw new Error('Bundled Next documentation is unavailable');
+          function walk(dir) {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const file = path.join(dir, entry.name);
+              if (entry.isDirectory()) walk(file);
+              else if (/server-and-client-components|use-client/.test(entry.name)) {
+                console.log('NEXT_GUIDE ' + file);
+                console.log(fs.readFileSync(file, 'utf8'));
+              }
+            }
+          }
+          walk(root);
+          NODE
+      - run: npm run build && npm run build:frontend
+      - run: cd frontend && npx --no-install playwright install --with-deps chromium
+      - name: Repeat the failing case in a fresh baseline environment
+        run: |
+          cd frontend
+          npx --no-install playwright test e2e/pos-keyboard-shortcuts.spec.ts --config=playwright.config.ts --project=chromium --grep='PaymentQueueDrawer Enter guards stale orders' --retries=0 --repeat-each=3 --trace=on
+      - name: Print failure snapshots
+        if: failure()
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          function walk(dir) {
+            if (!fs.existsSync(dir)) return;
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const file = path.join(dir, entry.name);
+              if (entry.isDirectory()) walk(file);
+              else if (entry.name === 'error-context.md') {
+                console.log('FAILURE_SNAPSHOT ' + file);
+                console.log(fs.readFileSync(file, 'utf8'));
+              }
+            }
+          }
+          walk('frontend/test-results');
+          NODE
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: isolated-baseline-keyboard-evidence
+          path: frontend/test-results/
+          retention-days: 30
